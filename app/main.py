@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import changes, db, packages as packages_svc, preflight as preflight_svc, projections, service
+from . import changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
 from .models import BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
@@ -19,12 +19,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
+        "支持只读分期骨架视图（/periodization）：同一期等价组与组间传递约简后的直接早于边；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -149,6 +150,24 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
     """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
     return service.query_relationship(a, b)
+
+
+@app.get("/periodization", tags=["query"])
+def get_periodization(
+    expected_revision: int = Query(
+        ge=0, description="预期的当前正式修订号；与当前不一致返回 409 STALE_REVISION（含当前修订号）"
+    ),
+):
+    """当前全部地层的分期骨架（只读）。
+
+    - 同一期断言连成等价组（含孤立地层，各自成组）：组内编号排序，组按最小编号排序；
+    - 组间早于关系图只保留传递约简后的直接边（不存在经其他组到达的路径）；
+    - 每条保留边列出该组间全部生效的直接早于证据编号（排序）；平行断言合并为一条边；
+    - 返回所用修订号、组、边与被传递关系省略的组间边数，顺序稳定；
+    - 修订号过期返回 409 STALE_REVISION（details.current_revision），不输出混合版本；
+      无断言时各地层各自成组、边为空。
+    """
+    return periodization_svc.get_periodization(expected_revision)
 
 
 # ------------------------------------------------------------------ 修订变化追踪

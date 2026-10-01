@@ -75,6 +75,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
 | GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
+| GET | `/periodization?expected_revision=1` | 只读分期骨架：同一期等价组 + 组间传递约简后的直接早于边（含孤立地层） |
 | POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}` |
 | GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情 |
 | GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论 |
@@ -197,6 +198,81 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 `relation` 取值：`same_period`（同一期）/ `earlier_than`（早于）/ `later_than`（晚于）/ `undetermined`（未定）。
+
+### 分期骨架视图：`GET /periodization`（只读）
+
+考古人员需要一次性查看**当前全部地层**在同一正式修订视图下的分期骨架。请求必须
+携带**预期的当前正式修订号** `expected_revision`（查询参数，≥0）：
+
+- **同一期（same_period）断言连成等价组**：对称、可传递；未被任何同一期断言连接
+  的地层（含完全没有断言时）**各自成组**，全部已登记地层恰好出现一次。
+  组内地层编号排序，全部组按**组内最小编号**排序，组序号 `group` 从 1 起；
+- **组间早于关系图**：每条生效“早于”断言投影到其两端所在的等价组上，
+  先把同一组间的**平行断言合并为一条边**，再做**传递约简**——
+  当源组到目标组已存在“经其他组”（路径长度 ≥ 2）的先后关系时，该直接边可由
+  传递推出，予以省略；只保留**不存在经其他组到达**的直接先后边；
+- 每条保留边给出 `from_group` / `to_group`、双方组最小编号
+  （`from_min_stratum` / `to_min_stratum`，方向即时间方向：源组早于目标组），
+  以及该组间**全部生效的直接早于证据编号** `evidence`（按编号排序）；
+- `omitted_edge_count`：**被传递关系省略的组间边数**（平行断言合并后计数，
+  即“直接商图边数 − 保留边数”）；
+- 返回顺序稳定：组按最小编号排序，边按 `(源组最小编号, 目标组最小编号)` 排序，
+  证据按编号排序。
+
+**修订号与一致性**：视图在 `REPEATABLE READ READ ONLY` 快照事务内读取，
+修订号在事务内只读一次：`expected_revision` 与当前一致才返回，响应中的
+`expected_revision`、`current_revision`、`revision` 恒相同；过期返回 **HTTP 409
+`STALE_REVISION`**（`details.current_revision` 为当前修订号），**不输出任何混合
+版本数据**——调用方取当前修订号后重新查询。该接口只读，不写库、不递增修订号、
+不产生变化记录；批次、关系查询、定版、推演的既有请求与返回约定均未改变。
+
+```bash
+curl -s "$BASE/periodization?expected_revision=1"
+```
+
+```json
+{
+  "expected_revision": 1,
+  "current_revision": 1,
+  "revision": 1,
+  "groups": [
+    {"group": 1, "min_stratum": "L1", "strata": ["L1", "L2"]},
+    {"group": 2, "min_stratum": "L3", "strata": ["L3"]},
+    {"group": 3, "min_stratum": "L4", "strata": ["L4", "L5"]},
+    {"group": 4, "min_stratum": "L6", "strata": ["L6"]}
+  ],
+  "edges": [
+    {
+      "from_group": 1,
+      "to_group": 2,
+      "from_min_stratum": "L1",
+      "to_min_stratum": "L3",
+      "relation": "earlier_than",
+      "relation_label": "早于",
+      "evidence": ["EV-002", "EV-020"]
+    },
+    {
+      "from_group": 2,
+      "to_group": 3,
+      "from_min_stratum": "L3",
+      "to_min_stratum": "L4",
+      "relation": "earlier_than",
+      "relation_label": "早于",
+      "evidence": ["EV-003"]
+    }
+  ],
+  "omitted_edge_count": 1
+}
+```
+
+上例中 `G1 早于 G3` 的直接断言（EV-010、EV-011）因 `G1 -> G2 -> G3` 已能推出而
+被省略（平行两条只记为 1 条被省略边）。无断言时 `groups` 为各地层单元素组、
+`edges` 为 `[]`、`omitted_edge_count` 为 `0`。完整端到端示例（无断言、平行合并、
+传递省略、孤立地层、过期拒绝、撤回后重算）：
+
+```bash
+bash examples/periodization_demo.sh
+```
 
 ### 错误码
 
@@ -473,6 +549,13 @@ bash examples/packages_demo.sh
 bash examples/demo.sh
 ```
 
+分期骨架视图演示（无断言各自成组、同一期等价组、平行断言合并、
+传递边省略、孤立地层、过期修订号拒绝、撤回后骨架重算）：
+
+```bash
+bash examples/periodization_demo.sh
+```
+
 提交前预检演示（原批可通过 / 建议最少撤回 / 预算不足附冲突路径 /
 新断言自成矛盾不可修复 / 拒绝语义沿用正式批次 / 全程只读）：
 
@@ -517,12 +600,14 @@ app/
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
+  periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   changes.py      # 正式修订变化追踪：前后差异计算、游标分页、启动历史回填
-  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径
+  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径、分期骨架
   db.py           # 连接池与模式初始化（启动时自动建表、幂等回填）
   models.py       # 请求模型
 examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
+  periodization_demo.sh # 分期骨架视图示例（等价组/平行合并/传递省略/过期拒绝/撤回重算）
   preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/只读校验）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）

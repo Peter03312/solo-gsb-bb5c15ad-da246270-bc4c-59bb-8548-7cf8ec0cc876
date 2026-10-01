@@ -13,8 +13,9 @@
 from __future__ import annotations
 
 import heapq
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 SAME = "same_period"
 EARLIER = "earlier_than"
@@ -226,3 +227,121 @@ class Derivation:
         if p is not None:
             return "later_than", list(p)
         return "undetermined", None
+
+
+# ------------------------------------------------------------------ 分期骨架
+@dataclass(frozen=True)
+class SkeletonEdge:
+    """组间早于关系图上的一条**直接**（传递约简后保留）边。
+
+    from_min < to_min 不做要求：方向即时间方向（from 组早于 to 组）；
+    evidence 为该组间全部生效的直接早于证据编号（平行断言合并为一条边，按编号排序）。
+    """
+
+    from_group: int          # 组序号（组按最小编号排序后从 1 起）
+    to_group: int
+    from_min: str            # 源组最小编号（稳定标识）
+    to_min: str
+    evidence: Tuple[str, ...]
+
+
+@dataclass
+class Skeleton:
+    """分期骨架：同一期等价组（含孤立地层）+ 组间直接早于关系图（传递约简图）。"""
+
+    groups: Tuple[Tuple[str, ...], ...]  # 每组内地层按编号排序；组间按首元素（最小编号）排序
+    edges: Tuple[SkeletonEdge, ...]      # 边按 (源组最小编号, 目标组最小编号) 排序
+    omitted_edge_count: int              # 被传递关系省略的组间边数（平行断言只算一条边）
+
+
+def periodization_skeleton(
+    strata: Sequence[str],
+    assertions: Sequence[Assertion],
+) -> Skeleton:
+    """由已登记地层与生效断言构造分期骨架（纯函数，结果顺序稳定）。
+
+    - 同一期（same_period）断言的传递闭包构成等价类；未出现在任何同一期断言中的
+      地层各自成组（孤立地层），因此全部已登记地层恰好出现一次；
+    - 组间早于图：每条生效“早于”断言按其两端所在组投影为一条商图有向边
+      （源组早于目标组），同一组间的多条平行断言合并为一条边；
+    - 传递约简：若从源组到目标组存在长度 >= 2 的组间路径（经其他组），则该直接边
+      可由传递关系推出，予以省略；只保留“不存在经其他组到达”的直接先后边。
+      生效断言集已通过 validate()（无组内早于、商图为 DAG），DAG 的传递约简唯一。
+    """
+    uf = UnionFind()
+    for s in strata:
+        uf.find(s)
+    for a in assertions:
+        uf.find(a.a)
+        uf.find(a.b)
+    for a in assertions:
+        if a.relation == SAME:
+            uf.union(a.a, a.b)
+
+    members: Dict[str, List[str]] = defaultdict(list)
+    for s in strata:
+        members[uf.find(s)].append(s)
+    groups_list = [sorted(m) for m in members.values()]
+    groups_list.sort(key=lambda g: g[0])
+    groups_tuple = tuple(tuple(g) for g in groups_list)
+
+    # 最小地层编号 -> 组序号（从 1 起），组按最小编号排序
+    index_by_min: Dict[str, int] = {g[0]: i + 1 for i, g in enumerate(groups_tuple)}
+    index_by_root: Dict[str, int] = {uf.find(g[0]): i + 1 for i, g in enumerate(groups_tuple)}
+
+    # 平行断言合并：(源组最小编号, 目标组最小编号) -> 全部生效直接早于证据编号
+    raw_edges: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    for a in assertions:
+        if a.relation != EARLIER:
+            continue
+        ra, rb = uf.find(a.a), uf.find(a.b)
+        if ra == rb:
+            # 生效断言集理论上已通过 validate()（组内早于是冲突，不可能落库）；
+            # 防御性跳过，保证骨架视图在任何输入下只产出组间边。
+            continue
+        ga, gb = groups_list[index_by_root[ra] - 1], groups_list[index_by_root[rb] - 1]
+        raw_edges[(ga[0], gb[0])].add(a.evidence_id)
+
+    # 商图邻接（不含证据），用于“是否存在经其他组到达”的可达性判定
+    adj: Dict[str, Set[str]] = {g[0]: set() for g in groups_tuple}
+    for (u, v) in raw_edges:
+        adj[u].add(v)
+
+    def reachable_via_other(src: str, dst: str) -> bool:
+        """从 src 出发是否存在长度 >= 2 的组间路径到达 dst（必须经过中间组）。
+
+        枚举 src 的直接后继（跳过直达 dst 的那条边，且同组间平行断言已合并为一条边），
+        再判断该后继能否（经零或多条组间边）到达 dst。商图是 DAG，普通 BFS 即可。
+        """
+        for first in adj.get(src, ()):  # 第一步：必须经过另一个组
+            if first == dst:
+                continue
+            seen = {first}
+            queue = deque([first])
+            while queue:
+                node = queue.popleft()
+                if node == dst:
+                    return True
+                for nxt in adj.get(node, ()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        queue.append(nxt)
+        return False
+
+    kept: List[SkeletonEdge] = []
+    omitted = 0
+    for (umin, vmin), evidence in raw_edges.items():
+        if reachable_via_other(umin, vmin):
+            omitted += 1
+            continue
+        kept.append(
+            SkeletonEdge(
+                from_group=index_by_min[umin],
+                to_group=index_by_min[vmin],
+                from_min=umin,
+                to_min=vmin,
+                evidence=tuple(sorted(evidence)),
+            )
+        )
+    kept.sort(key=lambda e: (e.from_min, e.to_min))
+    return Skeleton(groups=groups_tuple, edges=tuple(kept), omitted_edge_count=omitted)
