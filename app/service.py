@@ -172,6 +172,31 @@ def query_relationship(a: str, b: str) -> Dict[str, Any]:
             return payload
 
 
+# ------------------------------------------------------------------ 分期骨架
+def query_phasing_skeleton(expected_revision: int) -> Dict[str, Any]:
+    """只读查询当前全部地层的分期骨架（同一期等价组 + 组间早于图传递约简）。
+
+    请求须携带当前正式修订号：过期返回 STALE_REVISION（details 含当前修订号），
+    不输出混合版本。全部读取在 REPEATABLE READ READ ONLY 快照事务的同一正式视图中
+    完成，不生成修订、变化记录或断言。
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
+            cur.execute("SELECT revision FROM revision_counter WHERE id = TRUE")
+            current = cur.fetchone()[0]
+            if expected_revision != current:
+                raise ApiError(
+                    409,
+                    "STALE_REVISION",
+                    f"修订号过期：请求携带 {expected_revision}，当前为 {current}",
+                    {"expected_revision": expected_revision, "current_revision": current},
+                )
+            payload = Derivation(_load_active(cur)).phasing_skeleton(_load_strata(cur))
+            payload.update({"expected_revision": expected_revision, "revision": current})
+            return payload
+
+
 # ------------------------------------------------------------------ 定版
 def create_snapshot(label: Optional[str]) -> Dict[str, Any]:
     """定版：把当前修订号下全部可确定的关系结论固化为不可变快照。"""

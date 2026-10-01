@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SAME = "same_period"
 EARLIER = "earlier_than"
@@ -226,3 +226,80 @@ class Derivation:
         if p is not None:
             return "later_than", list(p)
         return "undetermined", None
+
+    # ------------------------------------------------------------------ 分期骨架
+    def phasing_skeleton(self, strata: Sequence[str]) -> Dict[str, Any]:
+        """当前视图下全部地层的分期骨架：同一期等价组 + 组间早于图的传递约简。
+
+        - 同一期断言把地层划分为等价组（对称、可传递），无任何断言的地层各自成组
+          （孤立地层同样返回）；组内地层按编号排序，全部组按组内最小编号排序并
+          从 1 开始顺序编号；
+        - 生效的早于断言投影为组间有向边（a 所在组 -> b 所在组，方向为“早于”），
+          同一组对间的平行断言只形成一条边，证据编号全部保留并按编号排序；
+        - 有效状态下组间图必为 DAG（组内早于 / 闭环均会在批次核验时被拒绝）；
+          只保留传递约简边：u->v 被省略当且仅当存在 u->w（w≠v）且 w 可沿组间图
+          到达 v，即 v 已能经其他组从 u 到达；
+        - 边按 (起点组序号, 终点组序号) 稳定排序，另返回被传递关系省略的直接
+          组间边数（平行断言已合并为一条边计数）。
+        """
+        # 1) 等价组：组内地层按编号排序
+        members: Dict[str, List[str]] = {}
+        for s in sorted(strata):
+            members.setdefault(self.uf.find(s), []).append(s)
+        roots_sorted = sorted(members, key=lambda r: members[r][0])
+
+        index_of: Dict[str, int] = {}
+        groups: List[Dict[str, Any]] = []
+        for i, root in enumerate(roots_sorted, start=1):
+            index_of[root] = i
+            groups.append({"index": i, "strata": members[root], "size": len(members[root])})
+
+        # 2) 直接组间边：(起点根, 终点根) -> 生效证据编号集合（平行断言合并）
+        raw: Dict[Tuple[str, str], set] = {}
+        for a in self.assertions:
+            if a.relation != EARLIER:
+                continue
+            ru, rv = self.uf.find(a.a), self.uf.find(a.b)
+            if ru == rv:
+                # 有效状态下不可能出现（组内早于会在批次核验时被整批拒绝），防御性跳过
+                continue
+            raw.setdefault((ru, rv), set()).add(a.evidence_id)
+
+        # 3) 组间 DAG 的可达集（DAG 中 w 可达 v 的路径不可能绕经 u，否则成环）
+        succ: Dict[str, set] = {r: set() for r in roots_sorted}
+        for ru, rv in raw:
+            succ.setdefault(ru, set()).add(rv)
+            succ.setdefault(rv, set())
+        reachable: Dict[str, set] = {}
+        for root in roots_sorted:
+            seen: set = set()
+            stack: List[str] = sorted(succ.get(root, ()))
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                stack.extend(sorted(succ.get(node, ())))
+            reachable[root] = seen
+
+        # 4) 传递约简：存在其他直达后继 w（w≠v）且 w 可达 v，则省略 u->v
+        edges: List[Dict[str, Any]] = []
+        for (ru, rv), evidence in raw.items():
+            redundant = any(v == rv for w in succ[ru] if w != rv for v in reachable.get(w, ()))
+            if redundant:
+                continue
+            edges.append(
+                {
+                    "from_group": index_of[ru],
+                    "to_group": index_of[rv],
+                    "evidence": sorted(evidence),
+                    "evidence_count": len(evidence),
+                }
+            )
+        edges.sort(key=lambda e: (e["from_group"], e["to_group"]))
+
+        return {
+            "groups": groups,
+            "edges": edges,
+            "omitted_edge_count": len(raw) - len(edges),
+        }

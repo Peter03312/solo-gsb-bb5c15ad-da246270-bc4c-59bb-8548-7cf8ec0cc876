@@ -19,12 +19,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
+        "支持分期骨架查询（/phasing-skeleton）：同一期等价组与组间早于图传递约简；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -149,6 +150,25 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
     """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
     return service.query_relationship(a, b)
+
+
+@app.get("/phasing-skeleton", tags=["query"])
+def get_phasing_skeleton(
+    expected_revision: int = Query(
+        ge=0, description="预期当前正式修订号；与当前不一致返回 409 STALE_REVISION（含当前修订号）"
+    ),
+):
+    """查询当前全部地层的分期骨架（只读）。
+
+    - 同一期断言在同一正式视图中划分为等价组（对称、可传递），无断言地层各自成组；
+      组内地层按编号排序，全部组按组内最小编号排序并从 1 起顺序编号；
+    - 早于断言投影为组间有向边（平行断言只形成一条边），边按 (起点组, 终点组)
+      排序，每条边列出该组对间全部生效的直接早于证据编号（按编号排序）；
+    - 只保留组间早于图的传递约简边：若终点组已能从起点组经其他组到达，则省略该
+      直接边；另返回被传递关系省略的组间边数 omitted_edge_count；
+    - 无断言时返回各自成组的全部地层与空边；查询只读，不改变修订号与断言。
+    """
+    return service.query_phasing_skeleton(expected_revision)
 
 
 # ------------------------------------------------------------------ 修订变化追踪

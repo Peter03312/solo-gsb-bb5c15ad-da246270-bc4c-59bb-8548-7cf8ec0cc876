@@ -33,6 +33,11 @@
   修订号对应的同一正式视图中先按原批次语义处理新增与撤回，再寻找**不包含本批新增证据、也不
   重复本批撤回**的额外撤回集合：撤回数最少、并列时按证据编号序列字典序最小，返回该集合与
   应用后是否通过关系核验。预检**不生成修订、变化记录或断言**，正式批次请求与返回格式不变。
+- **分期骨架（只读）**：`GET /phasing-skeleton?expected_revision=N` 返回当前全部地层的分期
+  骨架——同一期断言划成等价组（含无断言的孤立地层，各自成组），组内地层按编号排序、全部组
+  按组内最小编号排序；组间早于图只保留**传递约简边**（终点组已能从起点组经其他组到达的直接
+  边被省略），每条保留边列出该组对间全部生效的直接早于证据编号（平行断言只形成一条边），
+  另返回被传递关系省略的组间边数。请求须携带当前修订号，过期返回当前修订号且不输出混合版本。
 
 ## 快速开始
 
@@ -75,6 +80,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
 | GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
+| GET | `/phasing-skeleton?expected_revision=N` | 查询全部地层的分期骨架：同一期等价组与组间早于图传递约简（只读） |
 | POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}` |
 | GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情 |
 | GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论 |
@@ -197,6 +203,86 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 `relation` 取值：`same_period`（同一期）/ `earlier_than`（早于）/ `later_than`（晚于）/ `undetermined`（未定）。
+
+### 分期骨架：`GET /phasing-skeleton`（只读）
+
+考古人员查看当前**全部地层**的分期骨架：同一期等价组与组间“早于”先后图。
+
+- 请求以查询参数携带**预期正式修订号** `expected_revision`（≥0，必填）；
+- 在该修订号对应的**同一正式视图**内完成全部读取（`REPEATABLE READ READ ONLY`
+  快照事务），**只读**：不生成修订、变化记录或断言，现有批次、关系查询、定版及
+  推演的请求与返回约定均保持不变。
+
+**分组与排序**
+
+- 生效的同一期断言（对称、可传递）把地层划分为等价组；**无任何断言的地层也各自
+  成组**（孤立地层同样返回），已登记地层一个不漏；
+- 组内成员按地层编号排序；全部组按**组内最小编号**排序，并从 `1` 起顺序编号
+  （响应中的 `from_group` / `to_group` 即该编号）。
+
+**组间边与传递约简**
+
+- 生效的早于断言投影为组间有向边（`stratum_a` 所在组 → `stratum_b` 所在组，
+  方向即“早于”）；同一起点组与终点组之间的**平行断言只形成一条边**；
+- 组间早于图在有效状态下必为 DAG（组内早于 / 早于闭环都会在批次核验时被整批
+  拒绝）；图中只保留**传递约简边**：边 `u→v` 被省略当且仅当存在另一条直接边
+  `u→w`（`w≠v`）且 `w` 可经组间图到达 `v`——即 `v` 已能从 `u` 经**其他组**
+  到达；
+- 每条保留边列出该组对间**全部生效的直接早于证据编号**，按编号排序；被省略边
+  上的证据不出现在任何保留边中（其结论仍可经保留边推出）；
+- 保留边按 `(from_group, to_group)` 稳定排序；`omitted_edge_count` 是被传递
+  关系省略的**直接组间边数**（平行断言已先合并为一条边再计数）。
+
+**响应示例**（修订号 1，对应 `examples/skeleton_demo.sh` 的场景）：
+
+```json
+{
+  "groups": [
+    {"index": 1, "strata": ["L1", "L2"], "size": 2},
+    {"index": 2, "strata": ["L3"], "size": 1},
+    {"index": 3, "strata": ["L4"], "size": 1},
+    {"index": 4, "strata": ["L5"], "size": 1},
+    {"index": 5, "strata": ["L6"], "size": 1},
+    {"index": 6, "strata": ["L7"], "size": 1}
+  ],
+  "edges": [
+    {"from_group": 1, "to_group": 2, "evidence": ["EV-002"], "evidence_count": 1},
+    {"from_group": 2, "to_group": 3, "evidence": ["EV-003"], "evidence_count": 1},
+    {"from_group": 3, "to_group": 4, "evidence": ["EV-004"], "evidence_count": 1},
+    {"from_group": 3, "to_group": 5, "evidence": ["EV-005"], "evidence_count": 1}
+  ],
+  "omitted_edge_count": 1,
+  "expected_revision": 1,
+  "revision": 1
+}
+```
+
+- 上例中 `L2 早于 L5`（EV-009）与 `L2→L3→L4→L5` 指向同一先后结论：组 1 已能
+  经组 2、3 到达组 4，故该直接边被省略（`omitted_edge_count=1`）；L7 无断言，
+  仍作为孤立组（组 6）返回；
+- 之后再断言一条 `L3 早于 L4`（EV-010），组 2→组 3 仍是同一条边，其 `evidence`
+  变为 `["EV-003", "EV-010"]`（平行断言不成新边）；
+- **无断言时**：全部已登记地层各自成组、`edges=[]`、`omitted_edge_count=0`；
+  连地层都未登记时 `groups=[]`。
+
+**修订号过期**：`expected_revision` 与当前修订号不一致时返回 HTTP 409
+`STALE_REVISION`，`details.current_revision` 给出当前修订号——**不输出混合
+版本**的骨架内容（与批次的过期拒绝语义一致）：
+
+```json
+{
+  "error": {
+    "code": "STALE_REVISION",
+    "message": "修订号过期：请求携带 0，当前为 1",
+    "details": {"expected_revision": 0, "current_revision": 1}
+  }
+}
+```
+
+```bash
+curl "$BASE/phasing-skeleton?expected_revision=1"
+bash examples/skeleton_demo.sh
+```
 
 ### 错误码
 
@@ -473,6 +559,13 @@ bash examples/packages_demo.sh
 bash examples/demo.sh
 ```
 
+分期骨架查询演示（空骨架、同一期等价组与孤立地层、平行断言合并、传递边省略
+计数、修订号过期只回当前修订号）：
+
+```bash
+bash examples/skeleton_demo.sh
+```
+
 提交前预检演示（原批可通过 / 建议最少撤回 / 预算不足附冲突路径 /
 新断言自成矛盾不可修复 / 拒绝语义沿用正式批次 / 全程只读）：
 
@@ -518,11 +611,12 @@ app/
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   changes.py      # 正式修订变化追踪：前后差异计算、游标分页、启动历史回填
-  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径
+  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径、分期骨架传递约简
   db.py           # 连接池与模式初始化（启动时自动建表、幂等回填）
   models.py       # 请求模型
 examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
+  skeleton_demo.sh # 分期骨架查询示例（等价组/平行断言/传递约简/过期修订号）
   preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/只读校验）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
